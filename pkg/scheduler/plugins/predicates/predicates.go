@@ -24,6 +24,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilFeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -43,6 +45,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/vgpu"
 	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/framework/simulate"
 	"volcano.sh/volcano/pkg/scheduler/plugins/util/k8s"
 )
 
@@ -89,9 +92,24 @@ const (
 	ProportionalResourcesPrefix = ProportionalResource + "."
 )
 
+type filterPlugins struct {
+	nodeUnschedule    *nodeunschedulable.NodeUnschedulable
+	nodeAffinity      *nodeaffinity.NodeAffinity
+	nodePorts         *nodeports.NodePorts
+	taintToleration   *tainttoleration.TaintToleration
+	interPodAffinity  *interpodaffinity.InterPodAffinity
+	csiLimits         *nodevolumelimits.CSILimits
+	volumeZone        *volumezone.VolumeZone
+	podTopologySpread *podtopologyspread.PodTopologySpread
+}
+
 type predicatesPlugin struct {
 	// Arguments given for the plugin
 	pluginArguments framework.Arguments
+	// All supported predicate filter plugins
+	filterPlugins *filterPlugins
+	// Cycle states for tasks
+	cycleStateStates map[api.TaskID]*k8sframework.CycleState
 }
 
 // New return predicate plugin
@@ -230,8 +248,7 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 	pl := ssn.PodLister
 	nodeMap := ssn.NodeMap
 
-	pCache := predicateCacheNew()
-	predicate := enablePredicate(pp.pluginArguments)
+	pp.initFilterPlugins(nodeMap, ssn.KubeClient(), ssn.InformerFactory())
 
 	// Register event handlers to update task info in PodLister & nodeMap
 	ssn.AddEventHandler(&framework.EventHandler{
@@ -249,25 +266,16 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 				klog.Errorf("Failed to get node %s info from cache", nodeName)
 				return
 			}
-			//predicate gpu sharing
-			for _, val := range api.RegisteredDevices {
-				if devices, ok := nodeInfo.Others[val].(api.Devices); ok {
-					if !devices.HasDeviceRequest(pod) {
-						continue
-					}
 
-					err := devices.Allocate(ssn.KubeClient(), pod)
-					if err != nil {
-						klog.Errorf("AllocateToPod failed %s", err.Error())
-						return
-					}
-				} else {
-					klog.Warningf("Devices %s assertion conversion failed, skip", val)
-				}
+			err := pp.allocate(ssn.KubeClient(), pod, nodeInfo, false)
+			if err != nil {
+				klog.Errorf("AllocateToPod failed %s", err.Error())
+				return
 			}
 			node.AddPod(pod)
 			klog.V(4).Infof("predicates, update pod %s/%s allocate to node [%s]", pod.Namespace, pod.Name, nodeName)
 		},
+
 		DeallocateFunc: func(event *framework.Event) {
 			klog.V(4).Infoln("predicates, deallocate", event.Task.NodeName)
 			pod := pl.UpdateTask(event.Task, "")
@@ -283,25 +291,12 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 				klog.Errorf("Failed to get node %s info from cache", nodeName)
 				return
 			}
-
-			for _, val := range api.RegisteredDevices {
-				if devices, ok := nodeInfo.Others[val].(api.Devices); ok {
-					if !devices.HasDeviceRequest(pod) {
-						continue
-					}
-
-					// deallocate pod gpu id
-					err := devices.Release(ssn.KubeClient(), pod)
-					if err != nil {
-						klog.Errorf(err.Error())
-						return
-					}
-				} else {
-					klog.Warningf("Devices %s assertion conversion failed, skip", val)
-				}
+			err := pp.deallocate(ssn.KubeClient(), pod, nodeInfo, false)
+			if err != nil {
+				klog.Errorf("DeallocateToPod failed %s", err.Error())
+				return
 			}
-
-			err := node.RemovePod(pod)
+			err = node.RemovePod(pod)
 			if err != nil {
 				klog.Errorf("predicates, remove pod %s/%s from node [%s] error: %v", pod.Namespace, pod.Name, nodeName, err)
 				return
@@ -310,6 +305,23 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 		},
 	})
 
+	ssn.AddPrePredicateFn(pp.Name(), func(task *api.TaskInfo) error {
+		return pp.prePredicate(task)
+	})
+
+	ssn.AddPredicateFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) ([]*api.Status, error) {
+		return pp.predicate(task, node)
+	})
+}
+
+func (pp *predicatesPlugin) OnSessionClose(ssn *framework.Session) {}
+
+func (pp *predicatesPlugin) initFilterPlugins(nodeMap map[string]*k8sframework.NodeInfo, kubeClient kubernetes.Interface, informerFactory informers.SharedInformerFactory) {
+	pp.cycleStateStates = make(map[api.TaskID]*k8sframework.CycleState)
+	pp.filterPlugins = &filterPlugins{}
+	// Initialize k8s plugins
+	// TODO: Add more predicates, k8s.io/kubernetes/pkg/scheduler/framework/plugins/legacy_registry.go
+	handle := k8s.NewFrameworkHandle(nodeMap, kubeClient, informerFactory)
 	features := feature.Features{
 		EnableReadWriteOncePod:                       utilFeature.DefaultFeatureGate.Enabled(features.ReadWriteOncePod),
 		EnableVolumeCapacityPriority:                 utilFeature.DefaultFeatureGate.Enabled(features.VolumeCapacityPriority),
@@ -317,269 +329,341 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 		EnableNodeInclusionPolicyInPodTopologySpread: utilFeature.DefaultFeatureGate.Enabled(features.NodeInclusionPolicyInPodTopologySpread),
 		EnableMatchLabelKeysInPodTopologySpread:      utilFeature.DefaultFeatureGate.Enabled(features.MatchLabelKeysInPodTopologySpread),
 	}
-	// Initialize k8s plugins
-	// TODO: Add more predicates, k8s.io/kubernetes/pkg/scheduler/framework/plugins/legacy_registry.go
-	handle := k8s.NewFrameworkHandle(nodeMap, ssn.KubeClient(), ssn.InformerFactory())
+
 	// 1. NodeUnschedulable
 	plugin, _ := nodeunschedulable.New(nil, handle)
-	nodeUnscheduleFilter := plugin.(*nodeunschedulable.NodeUnschedulable)
+	pp.filterPlugins.nodeUnschedule = plugin.(*nodeunschedulable.NodeUnschedulable)
 	// 2. NodeAffinity
 	nodeAffinityArgs := config.NodeAffinityArgs{
 		AddedAffinity: &v1.NodeAffinity{},
 	}
 	plugin, _ = nodeaffinity.New(&nodeAffinityArgs, handle)
-	nodeAffinityFilter := plugin.(*nodeaffinity.NodeAffinity)
+	pp.filterPlugins.nodeAffinity = plugin.(*nodeaffinity.NodeAffinity)
 	// 3. NodePorts
 	plugin, _ = nodeports.New(nil, handle)
-	nodePortFilter := plugin.(*nodeports.NodePorts)
+	pp.filterPlugins.nodePorts = plugin.(*nodeports.NodePorts)
 	// 4. TaintToleration
 	plugin, _ = tainttoleration.New(nil, handle)
-	tolerationFilter := plugin.(*tainttoleration.TaintToleration)
+	pp.filterPlugins.taintToleration = plugin.(*tainttoleration.TaintToleration)
 	// 5. InterPodAffinity
 	plArgs := &config.InterPodAffinityArgs{}
 	plugin, _ = interpodaffinity.New(plArgs, handle)
-	podAffinityFilter := plugin.(*interpodaffinity.InterPodAffinity)
+	pp.filterPlugins.interPodAffinity = plugin.(*interpodaffinity.InterPodAffinity)
 	// 6. NodeVolumeLimits
 	plugin, _ = nodevolumelimits.NewCSI(nil, handle, features)
-	nodeVolumeLimitsCSIFilter := plugin.(*nodevolumelimits.CSILimits)
+	pp.filterPlugins.csiLimits = plugin.(*nodevolumelimits.CSILimits)
 	// 7. VolumeZone
 	plugin, _ = volumezone.New(nil, handle)
-	volumeZoneFilter := plugin.(*volumezone.VolumeZone)
+	pp.filterPlugins.volumeZone = plugin.(*volumezone.VolumeZone)
 	// 8. PodTopologySpread
 	// Setting cluster level default constraints is not support for now.
 	ptsArgs := &config.PodTopologySpreadArgs{DefaultingType: config.SystemDefaulting}
 	plugin, _ = podtopologyspread.New(ptsArgs, handle, features)
-	podTopologySpreadFilter := plugin.(*podtopologyspread.PodTopologySpread)
-
-	state := k8sframework.NewCycleState()
-	skipPlugins := make(map[api.TaskID]sets.Set[string])
-
-	ssn.AddPrePredicateFn(pp.Name(), func(task *api.TaskInfo) error {
-		// Check NodePorts
-		if predicate.nodePortEnable {
-			_, status := nodePortFilter.PreFilter(context.TODO(), state, task.Pod)
-			if !status.IsSuccess() {
-				return fmt.Errorf("plugin %s pre-predicates failed %s", interpodaffinity.Name, status.Message())
-			}
-		}
-
-		// InterPodAffinity Predicate
-		// TODO: Update the node information to be processed by the filer based on the node list returned by the prefilter.
-		// In K8S V1.25, the return value result is added to the Prefile interface,
-		// indicating the list of nodes that meet filtering conditions.
-		// If the value of result is nil, all nodes meet the conditions.
-		// If the specified node information exists, only the node information in result meets the conditions.
-		// The value of Prefile in the current InterPodAffinity package always returns nil.
-		// The outer layer does not need to be processed temporarily.
-		// If the filtering logic is added to the Prefile node in the Volumebinding package in the future,
-		// the processing logic needs to be added to the return value result.
-		if predicate.podAffinityEnable {
-			_, status := podAffinityFilter.PreFilter(context.TODO(), state, task.Pod)
-			if status.IsSkip() {
-				taskKey := api.PodKey(task.Pod)
-				if _, ok := skipPlugins[taskKey]; !ok {
-					plugins := sets.New[string]()
-					skipPlugins[taskKey] = plugins
-				}
-				skipPlugins[taskKey].Insert(interpodaffinity.Name)
-				klog.V(3).Infof("pod(%s/%s) affinity require information is nil, plugin InterPodAffinity is skipped",
-					task.Namespace, task.Name)
-			} else if !status.IsSuccess() {
-				return fmt.Errorf("plugin %s pre-predicates failed %s", interpodaffinity.Name, status.Message())
-			}
-		}
-
-		// Check PodTopologySpread
-		// TODO: Update the node information to be processed by the filer based on the node list returned by the prefilter.
-		// In K8S V1.25, the return value result is added to the Prefile interface,
-		// indicating the list of nodes that meet filtering conditions.
-		// If the value of result is nil, all nodes meet the conditions.
-		// If the specified node information exists, only the node information in result meets the conditions.
-		// The value of Prefile in the current PodTopologySpread package always returns nil.
-		// The outer layer does not need to be processed temporarily.
-		// If the filtering logic is added to the Prefile node in the Volumebinding package in the future,
-		// the processing logic needs to be added to the return value result.
-		if predicate.podTopologySpreadEnable {
-			_, status := podTopologySpreadFilter.PreFilter(context.TODO(), state, task.Pod)
-			if !status.IsSuccess() {
-				return fmt.Errorf("plugin %s pre-predicates failed %s", podTopologySpreadFilter.Name(), status.Message())
-			}
-		}
-		return nil
-	})
-
-	ssn.AddPredicateFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) ([]*api.Status, error) {
-		predicateStatus := make([]*api.Status, 0)
-		nodeInfo, found := nodeMap[node.Name]
-		if !found {
-			return predicateStatus, fmt.Errorf("failed to predicates, node info for %s not found", node.Name)
-		}
-
-		if node.Allocatable.MaxTaskNum <= len(nodeInfo.Pods) {
-			klog.V(4).Infof("NodePodNumber predicates Task <%s/%s> on Node <%s> failed, allocatable <%d>, existed <%d>",
-				task.Namespace, task.Name, node.Name, node.Allocatable.MaxTaskNum, len(nodeInfo.Pods))
-			podsNumStatus := &api.Status{
-				Code:   api.Unschedulable,
-				Reason: api.NodePodNumberExceeded,
-			}
-			predicateStatus = append(predicateStatus, podsNumStatus)
-		}
-
-		predicateByStablefilter := func(pod *v1.Pod, nodeInfo *k8sframework.NodeInfo) ([]*api.Status, bool, error) {
-			// CheckNodeUnschedulable
-			predicateStatus := make([]*api.Status, 0)
-			status := nodeUnscheduleFilter.Filter(context.TODO(), state, task.Pod, nodeInfo)
-			nodeUnscheduleStatus := framework.ConvertPredicateStatus(status)
-			if nodeUnscheduleStatus.Code != api.Success {
-				predicateStatus = append(predicateStatus, nodeUnscheduleStatus)
-				return predicateStatus, false, fmt.Errorf("plugin %s predicates failed %s", nodeUnscheduleFilter.Name(), status.Message())
-			}
-
-			// Check NodeAffinity
-			if predicate.nodeAffinityEnable {
-				status := nodeAffinityFilter.Filter(context.TODO(), state, task.Pod, nodeInfo)
-				nodeAffinityStatus := framework.ConvertPredicateStatus(status)
-				if nodeAffinityStatus.Code != api.Success {
-					predicateStatus = append(predicateStatus, nodeAffinityStatus)
-					return predicateStatus, false, fmt.Errorf("plugin %s predicates failed %s", nodeAffinityFilter.Name(), status.Message())
-				}
-			}
-
-			// PodToleratesNodeTaints: TaintToleration
-			if predicate.taintTolerationEnable {
-				status := tolerationFilter.Filter(context.TODO(), state, task.Pod, nodeInfo)
-				tolerationStatus := framework.ConvertPredicateStatus(status)
-				if tolerationStatus.Code != api.Success {
-					predicateStatus = append(predicateStatus, tolerationStatus)
-					return predicateStatus, false, fmt.Errorf("plugin %s predicates failed %s", tolerationFilter.Name(), status.Message())
-				}
-			}
-
-			return predicateStatus, true, nil
-		}
-
-		// Check PredicateWithCache
-		var err error
-		var fit bool
-		predicateCacheStatus := make([]*api.Status, 0)
-		if predicate.cacheEnable {
-			fit, err = pCache.PredicateWithCache(node.Name, task.Pod)
-			if err != nil {
-				predicateCacheStatus, fit, err = predicateByStablefilter(task.Pod, nodeInfo)
-				pCache.UpdateCache(node.Name, task.Pod, fit)
-			} else {
-				if !fit {
-					err = fmt.Errorf("plugin equivalence cache predicates failed")
-				}
-			}
-		} else {
-			predicateCacheStatus, fit, err = predicateByStablefilter(task.Pod, nodeInfo)
-		}
-
-		predicateStatus = append(predicateStatus, predicateCacheStatus...)
-		if !fit {
-			return predicateStatus, err
-		}
-
-		// Check NodePort
-		if predicate.nodePortEnable {
-			status := nodePortFilter.Filter(context.TODO(), state, nil, nodeInfo)
-			nodePortStatus := framework.ConvertPredicateStatus(status)
-			if nodePortStatus.Code != api.Success {
-				predicateStatus = append(predicateStatus, nodePortStatus)
-				return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", nodePortFilter.Name(), status.Message())
-			}
-		}
-
-		// Check PodAffinity
-		if predicate.podAffinityEnable {
-			isSkipInterPodAffinity := false
-			taskKey := api.PodKey(task.Pod)
-			if plugins, ok := skipPlugins[taskKey]; ok {
-				if plugins.Has(interpodaffinity.Name) {
-					isSkipInterPodAffinity = true
-					klog.V(5).Infof("pod(%s/%s) affinity require information is nil, plugin InterPodAffinity is skip for node %s",
-						task.Namespace, task.Name, node.Name)
-				}
-			}
-			if !isSkipInterPodAffinity {
-				status := podAffinityFilter.Filter(context.TODO(), state, task.Pod, nodeInfo)
-				podAffinityStatus := framework.ConvertPredicateStatus(status)
-				if podAffinityStatus.Code != api.Success {
-					predicateStatus = append(predicateStatus, podAffinityStatus)
-					return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", podAffinityFilter.Name(), status.Message())
-				}
-			}
-		}
-
-		// Check NodeVolumeLimits
-		if predicate.nodeVolumeLimitsEnable {
-			status := nodeVolumeLimitsCSIFilter.Filter(context.TODO(), state, task.Pod, nodeInfo)
-			nodeVolumeStatus := framework.ConvertPredicateStatus(status)
-			predicateStatus = append(predicateStatus, nodeVolumeStatus)
-		}
-
-		// Check VolumeZone
-		if predicate.volumeZoneEnable {
-			status := volumeZoneFilter.Filter(context.TODO(), state, task.Pod, nodeInfo)
-			volumeZoneStatus := framework.ConvertPredicateStatus(status)
-			if volumeZoneStatus.Code != api.Success {
-				predicateStatus = append(predicateStatus, volumeZoneStatus)
-				return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", volumeZoneFilter.Name(), status.Message())
-			}
-		}
-
-		// Check PodTopologySpread
-		if predicate.podTopologySpreadEnable {
-			status := podTopologySpreadFilter.Filter(context.TODO(), state, task.Pod, nodeInfo)
-			podTopologyStatus := framework.ConvertPredicateStatus(status)
-			if podTopologyStatus.Code != api.Success {
-				predicateStatus = append(predicateStatus, podTopologyStatus)
-				return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", podTopologySpreadFilter.Name(), status.Message())
-			}
-		}
-
-		for _, val := range api.RegisteredDevices {
-			if dev, ok := node.Others[val].(api.Devices); ok {
-				if dev == nil {
-					predicateStatus = append(predicateStatus, &api.Status{
-						Code:   devices.Unschedulable,
-						Reason: "node not initialized with device" + val,
-					})
-					return predicateStatus, fmt.Errorf("node not initialized with device %s", val)
-				}
-				code, msg, err := dev.FilterNode(task.Pod)
-				filterNodeStatus := &api.Status{
-					Code:   code,
-					Reason: msg,
-				}
-				if err != nil {
-					return predicateStatus, err
-				}
-				if filterNodeStatus.Code != api.Success {
-					predicateStatus = append(predicateStatus, filterNodeStatus)
-					return predicateStatus, fmt.Errorf("plugin device filternode predicates failed %s", msg)
-				}
-			} else {
-				klog.Warningf("Devices %s assertion conversion failed, skip", val)
-			}
-		}
-
-		klog.V(4).Infof("checkNodeGPUPredicate predicates Task <%s/%s> on Node <%s>: fit %v",
-			task.Namespace, task.Name, node.Name, fit)
-
-		if predicate.proportionalEnable {
-			// Check ProportionalPredicate
-			proportionalStatus, err := checkNodeResourceIsProportional(task, node, predicate.proportional)
-			if proportionalStatus.Code != api.Success {
-				predicateStatus = append(predicateStatus, proportionalStatus)
-				return predicateStatus, err
-			}
-			klog.V(4).Infof("checkNodeResourceIsProportional predicates Task <%s/%s> on Node <%s>: fit %v",
-				task.Namespace, task.Name, node.Name, fit)
-		}
-		return predicateStatus, nil
-	})
+	pp.filterPlugins.podTopologySpread = plugin.(*podtopologyspread.PodTopologySpread)
 }
 
-func (pp *predicatesPlugin) OnSessionClose(ssn *framework.Session) {}
+func (pp *predicatesPlugin) prePredicate(task *api.TaskInfo) error {
+	state := k8sframework.NewCycleState()
+	pp.cycleStateStates[task.UID] = state
+
+	predicate := enablePredicate(pp.pluginArguments)
+	skipPlugins := sets.New[string]()
+
+	// 1. Check NodePorts
+	if predicate.nodePortEnable {
+		_, status := pp.filterPlugins.nodePorts.PreFilter(context.TODO(), state, task.Pod)
+		if !status.IsSuccess() {
+			return fmt.Errorf("plugin %s pre-predicates failed %s", interpodaffinity.Name, status.Message())
+		}
+	}
+
+	// InterPodAffinity Predicate
+	// TODO: Update the node information to be processed by the filer based on the node list returned by the prefilter.
+	// In K8S V1.25, the return value result is added to the Prefile interface,
+	// indicating the list of nodes that meet filtering conditions.
+	// If the value of result is nil, all nodes meet the conditions.
+	// If the specified node information exists, only the node information in result meets the conditions.
+	// The value of Prefile in the current InterPodAffinity package always returns nil.
+	// The outer layer does not need to be processed temporarily.
+	// If the filtering logic is added to the Prefile node in the Volumebinding package in the future,
+	// the processing logic needs to be added to the return value result.
+	if predicate.podAffinityEnable {
+		_, status := pp.filterPlugins.interPodAffinity.PreFilter(context.TODO(), state, task.Pod)
+		if status.IsSkip() {
+			skipPlugins.Insert(interpodaffinity.Name)
+			klog.V(3).Infof("pod(%s/%s) affinity require information is nil, plugin InterPodAffinity is skipped",
+				task.Namespace, task.Name)
+		} else if !status.IsSuccess() {
+			return fmt.Errorf("plugin %s pre-predicates failed %s", interpodaffinity.Name, status.Message())
+		}
+	}
+
+	// Check PodTopologySpread
+	// TODO: Update the node information to be processed by the filer based on the node list returned by the prefilter.
+	// In K8S V1.25, the return value result is added to the Prefile interface,
+	// indicating the list of nodes that meet filtering conditions.
+	// If the value of result is nil, all nodes meet the conditions.
+	// If the specified node information exists, only the node information in result meets the conditions.
+	// The value of Prefile in the current PodTopologySpread package always returns nil.
+	// The outer layer does not need to be processed temporarily.
+	// If the filtering logic is added to the Prefile node in the Volumebinding package in the future,
+	// the processing logic needs to be added to the return value result.
+	if predicate.podTopologySpreadEnable {
+		_, status := pp.filterPlugins.podTopologySpread.PreFilter(context.TODO(), state, task.Pod)
+		if !status.IsSuccess() {
+			return fmt.Errorf("plugin %s pre-predicates failed %s", pp.filterPlugins.podTopologySpread.Name(), status.Message())
+		}
+	}
+
+	state.SkipFilterPlugins = skipPlugins
+	return nil
+}
+
+func (pp *predicatesPlugin) predicate(task *api.TaskInfo, node *api.NodeInfo) ([]*api.Status, error) {
+	var state *k8sframework.CycleState
+	if _, ok := pp.cycleStateStates[task.UID]; ok {
+		state = pp.cycleStateStates[task.UID]
+	} else {
+		state = k8sframework.NewCycleState()
+		klog.V(3).Infof("Missing cycleState States for task <%s/%s>", task.Namespace, task.Name)
+	}
+
+	pCache := predicateCacheNew()
+	predicate := enablePredicate(pp.pluginArguments)
+	k8sNodeInfo := framework.GenerateK8SNodeInfo(node)
+	predicateStatus := make([]*api.Status, 0)
+
+	if node.Allocatable.MaxTaskNum <= len(node.Pods()) {
+		klog.V(4).Infof("NodePodNumber predicates Task <%s/%s> on Node <%s> failed, allocatable <%d>, existed <%d>",
+			task.Namespace, task.Name, node.Name, node.Allocatable.MaxTaskNum, len(node.Pods()))
+		podsNumStatus := &api.Status{
+			Code:   api.Unschedulable,
+			Reason: api.NodePodNumberExceeded,
+		}
+		predicateStatus = append(predicateStatus, podsNumStatus)
+	}
+
+	predicateByStablefilter := func(pod *v1.Pod, nodeInfo *k8sframework.NodeInfo) ([]*api.Status, bool, error) {
+		// CheckNodeUnschedulable
+		predicateStatus := make([]*api.Status, 0)
+		status := pp.filterPlugins.nodeUnschedule.Filter(context.TODO(), state, task.Pod, nodeInfo)
+		nodeUnscheduleStatus := framework.ConvertPredicateStatus(status)
+		if nodeUnscheduleStatus.Code != api.Success {
+			predicateStatus = append(predicateStatus, nodeUnscheduleStatus)
+			return predicateStatus, false, fmt.Errorf("plugin %s predicates failed %s", pp.filterPlugins.nodeUnschedule.Name(), status.Message())
+		}
+
+		// Check NodeAffinity
+		if predicate.nodeAffinityEnable {
+			status := pp.filterPlugins.nodeAffinity.Filter(context.TODO(), state, task.Pod, nodeInfo)
+			nodeAffinityStatus := framework.ConvertPredicateStatus(status)
+			if nodeAffinityStatus.Code != api.Success {
+				predicateStatus = append(predicateStatus, nodeAffinityStatus)
+				return predicateStatus, false, fmt.Errorf("plugin %s predicates failed %s", pp.filterPlugins.nodeAffinity.Name(), status.Message())
+			}
+		}
+
+		// PodToleratesNodeTaints: TaintToleration
+		if predicate.taintTolerationEnable {
+			status := pp.filterPlugins.taintToleration.Filter(context.TODO(), state, task.Pod, nodeInfo)
+			tolerationStatus := framework.ConvertPredicateStatus(status)
+			if tolerationStatus.Code != api.Success {
+				predicateStatus = append(predicateStatus, tolerationStatus)
+				return predicateStatus, false, fmt.Errorf("plugin %s predicates failed %s", pp.filterPlugins.taintToleration.Name(), status.Message())
+			}
+		}
+
+		return predicateStatus, true, nil
+	}
+
+	// Check PredicateWithCache
+	var err error
+	var fit bool
+	predicateCacheStatus := make([]*api.Status, 0)
+	if predicate.cacheEnable {
+		fit, err = pCache.PredicateWithCache(node.Name, task.Pod)
+		if err != nil {
+			predicateCacheStatus, fit, err = predicateByStablefilter(task.Pod, k8sNodeInfo)
+			pCache.UpdateCache(node.Name, task.Pod, fit)
+		} else {
+			if !fit {
+				err = fmt.Errorf("plugin equivalence cache predicates failed")
+			}
+		}
+	} else {
+		predicateCacheStatus, fit, err = predicateByStablefilter(task.Pod, k8sNodeInfo)
+	}
+
+	predicateStatus = append(predicateStatus, predicateCacheStatus...)
+	if !fit {
+		return predicateStatus, err
+	}
+
+	// Check NodePort
+	if predicate.nodePortEnable {
+		status := pp.filterPlugins.nodePorts.Filter(context.TODO(), state, nil, k8sNodeInfo)
+		nodePortStatus := framework.ConvertPredicateStatus(status)
+		if nodePortStatus.Code != api.Success {
+			predicateStatus = append(predicateStatus, nodePortStatus)
+			return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", pp.filterPlugins.nodePorts.Name(), status.Message())
+		}
+	}
+
+	// Check PodAffinity
+	if predicate.podAffinityEnable {
+		isSkipInterPodAffinity := false
+		if state.SkipFilterPlugins.Has(interpodaffinity.Name) {
+			isSkipInterPodAffinity = true
+			klog.V(5).Infof("pod(%s/%s) affinity require information is nil, plugin InterPodAffinity is skip for node %s",
+				task.Namespace, task.Name, node.Name)
+		}
+
+		if !isSkipInterPodAffinity {
+			status := pp.filterPlugins.interPodAffinity.Filter(context.TODO(), state, task.Pod, k8sNodeInfo)
+			podAffinityStatus := framework.ConvertPredicateStatus(status)
+			if podAffinityStatus.Code != api.Success {
+				predicateStatus = append(predicateStatus, podAffinityStatus)
+				return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", pp.filterPlugins.interPodAffinity.Name(), status.Message())
+			}
+		}
+	}
+
+	// Check NodeVolumeLimits
+	if predicate.nodeVolumeLimitsEnable {
+		status := pp.filterPlugins.csiLimits.Filter(context.TODO(), state, task.Pod, k8sNodeInfo)
+		nodeVolumeStatus := framework.ConvertPredicateStatus(status)
+		predicateStatus = append(predicateStatus, nodeVolumeStatus)
+	}
+
+	// Check VolumeZone
+	if predicate.volumeZoneEnable {
+		status := pp.filterPlugins.volumeZone.Filter(context.TODO(), state, task.Pod, k8sNodeInfo)
+		volumeZoneStatus := framework.ConvertPredicateStatus(status)
+		if volumeZoneStatus.Code != api.Success {
+			predicateStatus = append(predicateStatus, volumeZoneStatus)
+			return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", pp.filterPlugins.volumeZone.Name(), status.Message())
+		}
+	}
+
+	// Check PodTopologySpread
+	if predicate.podTopologySpreadEnable {
+		status := pp.filterPlugins.podTopologySpread.Filter(context.TODO(), state, task.Pod, k8sNodeInfo)
+		podTopologyStatus := framework.ConvertPredicateStatus(status)
+		if podTopologyStatus.Code != api.Success {
+			predicateStatus = append(predicateStatus, podTopologyStatus)
+			return predicateStatus, fmt.Errorf("plugin %s predicates failed %s", pp.filterPlugins.podTopologySpread.Name(), status.Message())
+		}
+	}
+
+	for _, val := range api.RegisteredDevices {
+		if dev, ok := node.Others[val].(api.Devices); ok {
+			if dev == nil {
+				predicateStatus = append(predicateStatus, &api.Status{
+					Code:   devices.Unschedulable,
+					Reason: "node not initialized with device" + val,
+				})
+				return predicateStatus, fmt.Errorf("node not initialized with device %s", val)
+			}
+			code, msg, err := dev.FilterNode(task.Pod)
+			filterNodeStatus := &api.Status{
+				Code:   code,
+				Reason: msg,
+			}
+			if err != nil {
+				return predicateStatus, err
+			}
+			if filterNodeStatus.Code != api.Success {
+				predicateStatus = append(predicateStatus, filterNodeStatus)
+				return predicateStatus, fmt.Errorf("plugin device filternode predicates failed %s", msg)
+			}
+		} else {
+			klog.Warningf("Devices %s assertion conversion failed, skip", val)
+		}
+	}
+
+	klog.V(4).Infof("checkNodeGPUPredicate predicates Task <%s/%s> on Node <%s>: fit %v",
+		task.Namespace, task.Name, node.Name, fit)
+
+	if predicate.proportionalEnable {
+		// Check ProportionalPredicate
+		proportionalStatus, err := checkNodeResourceIsProportional(task, node, predicate.proportional)
+		if proportionalStatus.Code != api.Success {
+			predicateStatus = append(predicateStatus, proportionalStatus)
+			return predicateStatus, err
+		}
+		klog.V(4).Infof("checkNodeResourceIsProportional predicates Task <%s/%s> on Node <%s>: fit %v",
+			task.Namespace, task.Name, node.Name, fit)
+	}
+	return predicateStatus, nil
+}
+
+func (pp *predicatesPlugin) allocate(kubeClient kubernetes.Interface, pod *v1.Pod, node *api.NodeInfo, dryRun bool) error {
+	for _, val := range api.RegisteredDevices {
+		if devices, ok := node.Others[val].(api.Devices); ok {
+			if !devices.HasDeviceRequest(pod) {
+				continue
+			}
+
+			err := devices.Allocate(kubeClient, pod, dryRun)
+			if err != nil {
+				klog.Errorf("AllocateToPod failed %s", err.Error())
+				return err
+			}
+		} else {
+			klog.Warningf("Devices %s assertion conversion failed, skip", val)
+		}
+	}
+	return nil
+}
+
+func (pp *predicatesPlugin) deallocate(kubeClient kubernetes.Interface, pod *v1.Pod, node *api.NodeInfo, dryRun bool) error {
+	for _, val := range api.RegisteredDevices {
+		if devices, ok := node.Others[val].(api.Devices); ok {
+			if !devices.HasDeviceRequest(pod) {
+				continue
+			}
+
+			// deallocate pod gpu id
+			err := devices.Release(kubeClient, pod, dryRun)
+			if err != nil {
+				klog.Errorf(err.Error())
+				return err
+			}
+		} else {
+			klog.Warningf("Devices %s assertion conversion failed, skip", val)
+		}
+	}
+	return nil
+}
+
+var _ simulate.SimulatePlugin = &predicatesPlugin{}
+
+func (pp *predicatesPlugin) Simulate(sharedInfoLister simulate.SchedulingSimulateSharedInfo, pluginsRegister simulate.SimulatePluginsRegister) {
+	pp.initFilterPlugins(nil, sharedInfoLister.KubeClient(), sharedInfoLister.InformerFactory())
+	pluginsRegister.AddPrePredicateSimulatePlugin(pp)
+	pluginsRegister.AddPredicateSimulatePlugin(pp)
+	pluginsRegister.AddAllocateSimulatePlugin(pp)
+	pluginsRegister.AddDeallocateSimulatePlugin(pp)
+}
+
+func (pp *predicatesPlugin) PrePredicateSimulate(ctx context.Context, task *api.TaskInfo) error {
+	return pp.prePredicate(task)
+}
+
+func (pp *predicatesPlugin) PredicateSimulate(ctx context.Context, task *api.TaskInfo, node *api.NodeInfo) ([]*api.Status, error) {
+	return pp.predicate(task, node)
+}
+
+// 暂不支持gpu分配，因为没看懂逻辑，直接在allocate时向kubernetes发送了patch请求
+// 可能需要重构一下api/devices，不要直接向apiserver发送 pod的更新请求
+func (pp *predicatesPlugin) AllocateSimulate(ctx context.Context, task *api.TaskInfo, node *api.NodeInfo) error {
+	// gpu 模拟调度分配到pod annotations
+	return pp.allocate(nil, task.Pod, node, true)
+}
+
+// 暂不支持gpu分配，因为没看懂逻辑，直接在allocate时向kubernetes发送了patch请求
+// 可能需要重构一下api/devices，不要直接向apiserver发送 pod的更新请求
+func (pp *predicatesPlugin) DeallocateSimulate(ctx context.Context, task *api.TaskInfo, node *api.NodeInfo) error {
+	// gpu 模拟调度分配到pod annotations
+	return pp.deallocate(nil, task.Pod, node, true)
+}

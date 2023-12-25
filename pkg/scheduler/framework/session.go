@@ -510,22 +510,26 @@ func (ssn *Session) UpdateSchedulerNumaInfo(AllocatedSets map[string]api.ResNuma
 }
 
 // KubeClient returns the kubernetes client
-func (ssn Session) KubeClient() kubernetes.Interface {
+func (ssn *Session) KubeClient() kubernetes.Interface {
 	return ssn.kubeClient
 }
 
 // ClientConfig returns the rest client
-func (ssn Session) ClientConfig() *rest.Config {
+func (ssn *Session) ClientConfig() *rest.Config {
 	return ssn.restConfig
 }
 
 // InformerFactory returns the scheduler ShareInformerFactory
-func (ssn Session) InformerFactory() informers.SharedInformerFactory {
+func (ssn *Session) InformerFactory() informers.SharedInformerFactory {
 	return ssn.informerFactory
 }
 
+func (ssn *Session) ListK8sNodeInfos() map[string]*k8sframework.NodeInfo {
+	return ssn.NodeMap
+}
+
 // RecordPodGroupEvent records podGroup events
-func (ssn Session) RecordPodGroupEvent(podGroup *api.PodGroup, eventType, reason, msg string) {
+func (ssn *Session) RecordPodGroupEvent(podGroup *api.PodGroup, eventType, reason, msg string) {
 	if podGroup == nil {
 		return
 	}
@@ -539,7 +543,7 @@ func (ssn Session) RecordPodGroupEvent(podGroup *api.PodGroup, eventType, reason
 }
 
 // String return nodes and jobs information in the session
-func (ssn Session) String() string {
+func (ssn *Session) String() string {
 	msg := fmt.Sprintf("Session %v: \n", ssn.UID)
 
 	for _, job := range ssn.Jobs {

@@ -19,6 +19,9 @@ package gpushare
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
@@ -130,12 +133,17 @@ func (gs *GPUDevices) HasDeviceRequest(pod *v1.Pod) bool {
 	return false
 }
 
-func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod, dryRun bool) error {
 	ids := GetGPUIndex(pod)
-	patch := RemoveGPUIndexPatch()
-	_, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
-	if err != nil {
-		return errors.Errorf("patch pod %s failed with patch %s: %v", pod.Name, patch, err)
+	if dryRun {
+		delete(pod.Annotations, escapeJSONPointer(PredicateTime))
+		delete(pod.Annotations, escapeJSONPointer(GPUIndex))
+	} else {
+		patch := RemoveGPUIndexPatch()
+		_, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
+		if err != nil {
+			return errors.Errorf("patch pod %s failed with patch %s: %v", pod.Name, patch, err)
+		}
 	}
 
 	for _, id := range ids {
@@ -172,7 +180,7 @@ func (gs *GPUDevices) GetStatus() string {
 	return ""
 }
 
-func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod, dryRun bool) error {
 	klog.V(4).Infoln("DeviceSharing:Into AllocateToPod", pod.Name)
 	if getGPUMemoryOfPod(pod) > 0 {
 		if NodeLockEnable {
@@ -187,11 +195,17 @@ func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) err
 			return errors.Errorf("the node %s can't place the pod %s in ns %s", pod.Spec.NodeName, pod.Name, pod.Namespace)
 		}
 		id := ids[0]
-		patch := AddGPUIndexPatch([]int{id})
-		pod, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
-		if err != nil {
-			return errors.Errorf("patch pod %s failed with patch %s: %v", pod.Name, patch, err)
+		if dryRun {
+			pod.Annotations[escapeJSONPointer(PredicateTime)] = strconv.FormatInt(time.Now().UnixNano(), 10)
+			pod.Annotations[escapeJSONPointer(GPUIndex)] = strings.Trim(strings.Replace(fmt.Sprint([]int{id}), " ", ",", -1), "[]")
+		} else {
+			patch := AddGPUIndexPatch([]int{id})
+			pod, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
+			if err != nil {
+				return errors.Errorf("patch pod %s failed with patch %s: %v", pod.Name, patch, err)
+			}
 		}
+
 		dev, ok := gs.Device[id]
 		if !ok {
 			return errors.Errorf("failed to get GPU %d from node %s", id, gs.Name)
@@ -204,10 +218,15 @@ func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) err
 		if len(ids) == 0 {
 			return errors.Errorf("the node %s can't place the pod %s in ns %s", pod.Spec.NodeName, pod.Name, pod.Namespace)
 		}
-		patch := AddGPUIndexPatch(ids)
-		pod, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
-		if err != nil {
-			return errors.Errorf("patch pod %s failed with patch %s: %v", pod.Name, patch, err)
+		if dryRun {
+			pod.Annotations[escapeJSONPointer(PredicateTime)] = strconv.FormatInt(time.Now().UnixNano(), 10)
+			pod.Annotations[escapeJSONPointer(GPUIndex)] = strings.Trim(strings.Replace(fmt.Sprint(ids), " ", ",", -1), "[]")
+		} else {
+			patch := AddGPUIndexPatch(ids)
+			pod, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
+			if err != nil {
+				return errors.Errorf("patch pod %s failed with patch %s: %v", pod.Name, patch, err)
+			}
 		}
 		for _, id := range ids {
 			dev, ok := gs.Device[id]

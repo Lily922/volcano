@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package scheduler
+package framework
 
 import (
 	"fmt"
@@ -24,11 +24,9 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"volcano.sh/volcano/pkg/scheduler/conf"
-	"volcano.sh/volcano/pkg/scheduler/framework"
-	"volcano.sh/volcano/pkg/scheduler/plugins"
 )
 
-var defaultSchedulerConf = `
+var DefaultSchedulerConf = `
 actions: "enqueue, allocate, backfill"
 tiers:
 - plugins:
@@ -43,8 +41,8 @@ tiers:
   - name: nodeorder
 `
 
-func unmarshalSchedulerConf(confStr string) ([]framework.Action, []conf.Tier, []conf.Configuration, map[string]string, error) {
-	var actions []framework.Action
+func UnmarshalSchedulerConf(confStr string) ([]Action, []conf.Tier, []conf.Configuration, map[string]string, error) {
+	var actions []Action
 
 	schedulerConf := &conf.SchedulerConfiguration{}
 
@@ -66,7 +64,7 @@ func unmarshalSchedulerConf(confStr string) ([]framework.Action, []conf.Tier, []
 			if tier.Plugins[j].Name == "proportion" {
 				proportion = true
 			}
-			plugins.ApplyPluginConfDefaults(&schedulerConf.Tiers[i].Plugins[j])
+			ApplyPluginConfDefaults(&schedulerConf.Tiers[i].Plugins[j])
 		}
 		if hdrf && proportion {
 			return nil, nil, nil, nil, fmt.Errorf("proportion and drf with hierarchy enabled conflicts")
@@ -75,7 +73,7 @@ func unmarshalSchedulerConf(confStr string) ([]framework.Action, []conf.Tier, []
 
 	actionNames := strings.Split(schedulerConf.Actions, ",")
 	for _, actionName := range actionNames {
-		if action, found := framework.GetAction(strings.TrimSpace(actionName)); found {
+		if action, found := GetAction(strings.TrimSpace(actionName)); found {
 			actions = append(actions, action)
 		} else {
 			return nil, nil, nil, nil, fmt.Errorf("failed to find Action %s, ignore it", actionName)
@@ -85,10 +83,67 @@ func unmarshalSchedulerConf(confStr string) ([]framework.Action, []conf.Tier, []
 	return actions, schedulerConf.Tiers, schedulerConf.Configurations, schedulerConf.MetricsConfiguration, nil
 }
 
-func readSchedulerConf(confPath string) (string, error) {
+func ReadSchedulerConf(confPath string) (string, error) {
 	dat, err := os.ReadFile(confPath)
 	if err != nil {
 		return "", err
 	}
 	return string(dat), nil
+}
+
+// ApplyPluginConfDefaults sets option's filed to its default value if not set
+func ApplyPluginConfDefaults(option *conf.PluginOption) {
+	t := true
+
+	if option.EnabledJobOrder == nil {
+		option.EnabledJobOrder = &t
+	}
+	if option.EnabledJobReady == nil {
+		option.EnabledJobReady = &t
+	}
+	if option.EnabledJobPipelined == nil {
+		option.EnabledJobPipelined = &t
+	}
+	if option.EnabledJobEnqueued == nil {
+		option.EnabledJobEnqueued = &t
+	}
+	if option.EnabledTaskOrder == nil {
+		option.EnabledTaskOrder = &t
+	}
+	if option.EnabledPreemptable == nil {
+		option.EnabledPreemptable = &t
+	}
+	if option.EnabledReclaimable == nil {
+		option.EnabledReclaimable = &t
+	}
+	if option.EnabledQueueOrder == nil {
+		option.EnabledQueueOrder = &t
+	}
+	if option.EnabledPredicate == nil {
+		option.EnabledPredicate = &t
+	}
+	if option.EnabledBestNode == nil {
+		option.EnabledBestNode = &t
+	}
+	if option.EnabledNodeOrder == nil {
+		option.EnabledNodeOrder = &t
+	}
+	if option.EnabledTargetJob == nil {
+		option.EnabledTargetJob = &t
+	}
+	if option.EnabledReservedNodes == nil {
+		option.EnabledReservedNodes = &t
+	}
+	if option.EnabledVictim == nil {
+		option.EnabledVictim = &t
+	}
+	if option.EnabledJobStarving == nil {
+		option.EnabledJobStarving = &t
+	}
+	if option.EnabledOverused == nil {
+		option.EnabledOverused = &t
+	}
+	if option.EnabledAllocatable == nil {
+		option.EnabledAllocatable = &t
+	}
 }

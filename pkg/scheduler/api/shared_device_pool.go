@@ -59,9 +59,9 @@ type Devices interface {
 	// The accompanying status message should explain why the pod is unschedulable.
 	FilterNode(pod *v1.Pod) (int, string, error)
 	//Allocate action in predicate
-	Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) error
+	Allocate(kubeClient kubernetes.Interface, pod *v1.Pod, dryRun bool) error
 	//Release action in predicate
-	Release(kubeClient kubernetes.Interface, pod *v1.Pod) error
+	Release(kubeClient kubernetes.Interface, pod *v1.Pod, dryRun bool) error
 
 	//IgnredDevices notify vc-scheduler to ignore devices in return list
 	GetIgnoredDevices() []string

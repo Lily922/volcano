@@ -235,6 +235,13 @@ func GenerateNodeMapAndSlice(nodes map[string]*api.NodeInfo) map[string]*k8sfram
 	return nodeMap
 }
 
+func GenerateK8SNodeInfo(node *api.NodeInfo) *k8sframework.NodeInfo {
+	nodeInfo := k8sframework.NewNodeInfo(node.Pods()...)
+	nodeInfo.SetNode(node.Node)
+	nodeInfo.ImageStates = node.CloneImageSummary()
+	return nodeInfo
+}
+
 // CachedNodeInfo is used in nodeorder and predicate plugin
 type CachedNodeInfo struct {
 	Session *Session

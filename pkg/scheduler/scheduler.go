@@ -135,23 +135,23 @@ func (pc *Scheduler) loadSchedulerConf() {
 
 	var err error
 	pc.once.Do(func() {
-		pc.actions, pc.plugins, pc.configurations, pc.metricsConf, err = unmarshalSchedulerConf(defaultSchedulerConf)
+		pc.actions, pc.plugins, pc.configurations, pc.metricsConf, err = framework.UnmarshalSchedulerConf(framework.DefaultSchedulerConf)
 		if err != nil {
-			klog.Errorf("unmarshal scheduler config %s failed: %v", defaultSchedulerConf, err)
+			klog.Errorf("unmarshal scheduler config %s failed: %v", framework.DefaultSchedulerConf, err)
 			panic("invalid default configuration")
 		}
 	})
 
 	var config string
 	if len(pc.schedulerConf) != 0 {
-		if config, err = readSchedulerConf(pc.schedulerConf); err != nil {
+		if config, err = framework.ReadSchedulerConf(pc.schedulerConf); err != nil {
 			klog.Errorf("Failed to read scheduler configuration '%s', using previous configuration: %v",
 				pc.schedulerConf, err)
 			return
 		}
 	}
 
-	actions, plugins, configurations, metricsConf, err := unmarshalSchedulerConf(config)
+	actions, plugins, configurations, metricsConf, err := framework.UnmarshalSchedulerConf(config)
 	if err != nil {
 		klog.Errorf("scheduler config %s is invalid: %v", config, err)
 		return

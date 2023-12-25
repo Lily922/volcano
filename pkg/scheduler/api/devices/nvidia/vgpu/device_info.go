@@ -174,7 +174,7 @@ func (gs *GPUDevices) HasDeviceRequest(pod *v1.Pod) bool {
 	return false
 }
 
-func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod, isSimulate bool) error {
 	// Nothing needs to be done here
 	return nil
 }
@@ -192,7 +192,7 @@ func (gs *GPUDevices) FilterNode(pod *v1.Pod) (int, string, error) {
 	return devices.Success, "", nil
 }
 
-func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod, dryRun bool) error {
 	if VGPUEnable {
 		klog.V(3).Infoln("VGPU DeviceSharing:Into AllocateToPod", pod.Name)
 		fit, device, err := checkNodeGPUSharingPredicate(pod, gs, false)
@@ -216,10 +216,17 @@ func (gs *GPUDevices) Allocate(kubeClient kubernetes.Interface, pod *v1.Pod) err
 
 		annotations[DeviceBindPhase] = "allocating"
 		annotations[BindTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
-		err = patchPodAnnotations(pod, annotations)
-		if err != nil {
-			return err
+		if dryRun {
+			for k, v := range annotations {
+				pod.Annotations[k] = v
+			}
+		} else {
+			err = patchPodAnnotations(pod, annotations)
+			if err != nil {
+				return err
+			}
 		}
+
 		gs.GetStatus()
 		klog.V(3).Infoln("DeviceSharing:Allocate Success")
 	}
